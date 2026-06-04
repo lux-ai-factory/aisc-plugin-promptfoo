@@ -1,0 +1,28 @@
+[project]
+name = "aisc-plugin-promptfoo"
+version = "0.1.0"
+description = "AISC evaluation plugin wrapping the promptfoo CLI (Node tool provided by the image)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aisc-plugin-interface @ git+https://github.com/lux-ai-factory/aisc-plugin-interface.git@v0.2.4",
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+report = ["vera-report-plugin-interface", "sqlalchemy>=2.0.48", "jinja2>=3.1"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aisc_plugin_promptfoo", "report/aisc_plugin_promptfoo_report"]
+
+[tool.uv.sources]
+aisc-plugin-interface = { git = "https://github.com/lux-ai-factory/aisc-plugin-interface.git", tag = "v0.2.4" }
+vera-report-plugin-interface = { git = "https://github.com/lux-ai-factory/vera-report-plugin-interface" }

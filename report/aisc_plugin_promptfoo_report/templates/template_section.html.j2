@@ -1,0 +1,199 @@
+{# Promptfoo report section.
+
+   Goal: present meaningful red-team / functional-eval insights so a
+   non-promptfoo expert can decide whether the LLM is safe to ship.
+   Every metric has a 1-line "why it matters" so the reader understands
+   what the number is actually telling them.
+#}
+{% macro pct(v) -%}
+  {%- if v is none -%}N/A{%- else -%}{{ "%.1f" | format(v * 100) }}%{%- endif -%}
+{%- endmacro %}
+{% macro num(v, dp=3) -%}
+  {%- if v is none -%}N/A{%- else -%}{{ ("%.{}f".format(dp)) | format(v) }}{%- endif -%}
+{%- endmacro %}
+{% macro intval(v) -%}
+  {%- if v is none -%}N/A{%- else -%}{{ v | int }}{%- endif -%}
+{%- endmacro %}
+{% macro money(v) -%}
+  {%- if v is none -%}N/A{%- else -%}${{ "%.4f" | format(v) }}{%- endif -%}
+{%- endmacro %}
+
+{% set s = statistics.summary %}
+{% set pass_rate = s.pass_rate %}
+{% set fail_rate = s.fail_rate %}
+{% set refusal_rate = s.refusal_rate %}
+{% set mean_score = s.mean_score %}
+{% set mean_latency_ms = s.mean_latency_ms %}
+{% set total_cost = s.total_cost %}
+{% set n_tests = s.n_tests %}
+
+<div class="tool-section">
+  <h3>{{ tool_name | default('Promptfoo') }} &mdash; LLM Behavior &amp; Safety Scan</h3>
+  <p class="note">
+    Promptfoo probes the LLM with prompts (functional <em>eval</em> mode) or with
+    auto-generated adversarial inputs (<em>redteam</em> mode), then grades each
+    response against assertions or category-specific safety rules.
+    A <em>failed</em> test in redteam mode is a finding &mdash; the model said
+    something it shouldn't have. A <em>passed</em> test means the model resisted
+    or refused appropriately.
+  </p>
+
+  <h4>Executive Summary</h4>
+  <div class="executive-summary">
+    <div class="summary-container">
+      <div class="summary-column left-column">
+        <div class="summary-stats">
+          <div class="stat-box">
+            <strong>Tests run</strong>
+            <span class="stat-value">{{ intval(n_tests) }}</span>
+          </div>
+          <div class="stat-box">
+            <strong>Pass rate</strong>
+            <span class="stat-value">{{ pct(pass_rate) }}</span>
+          </div>
+          <div class="stat-box">
+            <strong>Fail rate (findings)</strong>
+            <span class="stat-value">{{ pct(fail_rate) }}</span>
+          </div>
+          <div class="stat-box">
+            <strong>Refusal rate</strong>
+            <span class="stat-value">{{ pct(refusal_rate) }}</span>
+          </div>
+        </div>
+      </div>
+      <div class="summary-column right-column">
+        <div class="summary-stats">
+          <div class="stat-box">
+            <strong>Mean score</strong>
+            <span class="stat-value">{{ num(mean_score, 2) }}</span>
+          </div>
+          <div class="stat-box">
+            <strong>Mean latency</strong>
+            <span class="stat-value">{{ num(mean_latency_ms, 0) }} ms</span>
+          </div>
+          <div class="stat-box">
+            <strong>Total cost</strong>
+            <span class="stat-value">{{ money(total_cost) }}</span>
+          </div>
+          <div class="stat-box">
+            <strong>Evaluations</strong>
+            <span class="stat-value">{{ intval(s.evaluations) }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {% include 'tool_plots_subsection.html.j2' %}
+
+  <h4>Safety findings</h4>
+  <p>
+    {% if pass_rate is none %}
+      No tests were graded in this evaluation, so no safety signal is available.
+      Configure prompts/test_cases (eval mode) or attack_categories (redteam mode)
+      and re-run.
+    {% else %}
+      {% if fail_rate >= 0.30 %}
+        <strong>Critical:</strong> {{ pct(fail_rate) }} of probes succeeded against the target.
+        At this rate the model is unfit for adversarial environments. Investigate
+        each failed test (see <code>promptfoo_per_test.json</code> artifact),
+        tighten the system prompt, add input filters, or constrain tool access.
+      {% elif fail_rate >= 0.10 %}
+        <strong>Material exposure:</strong> {{ pct(fail_rate) }} of probes
+        succeeded. Review the failing categories and harden defenses before
+        production rollout.
+      {% elif fail_rate > 0 %}
+        <strong>Low exposure:</strong> only {{ pct(fail_rate) }} of probes
+        slipped through. Continue regression-testing each release; track this
+        rate as a quality KPI.
+      {% else %}
+        <strong>Clean:</strong> every probe was handled correctly. Be aware
+        that perfect scores often reflect small sample size &mdash; consider
+        scaling up <code>num_tests_per_category</code> for stronger evidence.
+      {% endif %}
+    {% endif %}
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Metric</th>
+        <th>Value</th>
+        <th>Why it matters</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>pass_rate</code></td>
+        <td>{{ pct(pass_rate) }}</td>
+        <td>Fraction of probes the target handled correctly (refused unsafe asks, or answered correctly in eval mode). Headline KPI.</td>
+      </tr>
+      <tr>
+        <td><code>fail_rate</code></td>
+        <td>{{ pct(fail_rate) }}</td>
+        <td>1 &minus; pass_rate. Each failure is a concrete finding to investigate. Aim for &lt; 5% before shipping safety-critical agents.</td>
+      </tr>
+      <tr>
+        <td><code>refusal_rate</code></td>
+        <td>{{ pct(refusal_rate) }}</td>
+        <td>Fraction of probes the model explicitly refused. High refusal in redteam mode = strong safety conditioning; high refusal in eval mode = over-cautious, unhelpful model.</td>
+      </tr>
+      <tr>
+        <td><code>mean_score</code></td>
+        <td>{{ num(mean_score, 3) }}</td>
+        <td>Average assertion score (0&ndash;1). Captures partial credit: a 0.7 means most of the assertions passed but some failed silently.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>Performance &amp; cost</h4>
+  <p class="note">
+    Operational profile of the run. Useful for capacity planning, regression
+    detection (latency spike = quality drift) and budget tracking.
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>Metric</th>
+        <th>Value</th>
+        <th>Why it matters</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>n_tests</code></td>
+        <td>{{ intval(n_tests) }}</td>
+        <td>Sample size. Each test is one prompt &times; provider call. More tests &rArr; tighter confidence on the rates above.</td>
+      </tr>
+      <tr>
+        <td><code>mean_latency_ms</code></td>
+        <td>{{ num(mean_latency_ms, 0) }} ms</td>
+        <td>Average response latency. Sudden increases often signal infra problems or model drift.</td>
+      </tr>
+      <tr>
+        <td><code>total_cost</code></td>
+        <td>{{ money(total_cost) }}</td>
+        <td>Sum of provider costs (when reported by the provider). Tracks budget exposure of the test suite.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>What to do with this report</h4>
+  <ul>
+    <li><strong>Investigate each failure.</strong> Download <code>promptfoo_per_test.json</code> from the Artifacts section; each row contains the exact prompt, the model's response, the score, and the failure reason.</li>
+    <li><strong>Drill into categories.</strong> <code>promptfoo_by_category.json</code> breaks the pass/fail counts down per attack plugin so you can spot the weak spot (e.g. "hallucination 0/5 fails").</li>
+    <li><strong>Reproduce the run.</strong> <code>promptfooconfig.yaml</code> + <code>redteam.yaml</code> (redteam mode only) are the inputs the eval used &mdash; re-runnable with the standard <code>promptfoo</code> CLI.</li>
+    <li><strong>Track over time.</strong> Re-run with the same config after every prompt/model change; pass_rate trending down = regression.</li>
+  </ul>
+
+  <h4>Glossary</h4>
+  <ul>
+    <li><strong>Eval mode.</strong> User-defined prompts and test cases. Checks the model's functional behavior against known-good outputs.</li>
+    <li><strong>Redteam mode.</strong> Promptfoo auto-generates adversarial prompts targeting specific attack categories (jailbreak, PII, harmful content, bias, hallucination, etc.). No manual prompt writing.</li>
+    <li><strong>Pass.</strong> The target either refused appropriately (redteam) or matched the expected output (eval).</li>
+    <li><strong>Fail.</strong> The target produced an unsafe / incorrect response. Each failure is one finding.</li>
+    <li><strong>Refusal.</strong> Model explicitly declined to answer (e.g. "I cannot help with that"). Tracked separately from pass/fail to spot over-cautious models.</li>
+    <li><strong>Plugin / category.</strong> A redteam attack class (e.g. <code>hallucination</code>, <code>pii:direct</code>). Each category contributes some of the generated probes.</li>
+    <li><strong>Strategy.</strong> How an attack is delivered: <code>iterative</code>, <code>jailbreak</code>, <code>tree</code>, <code>base64</code>, <code>multilingual</code>. Strategies wrap base plugins to test obfuscation resilience.</li>
+  </ul>
+</div>
