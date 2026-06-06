@@ -1,13 +1,17 @@
 [project]
 name = "aisc-plugin-promptfoo"
 version = "0.1.0"
-description = "AISC evaluation plugin wrapping the promptfoo CLI (Node tool provided by the image)."
+description = "AISC evaluation plugin wrapping the promptfoo CLI (Node bundled with the plugin; no Node required on the host/image)."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "aisc-plugin-interface @ git+https://github.com/lux-ai-factory/aisc-plugin-interface.git@v0.2.4",
     "pydantic>=2.6",
     "pyyaml>=6.0",
+    # Self-contained Node runtime: promptfoo is a Node CLI, so ship Node with the
+    # plugin rather than requiring it on the platform image. Provides node/npm/npx
+    # under the package bin/ dir (resolved at runtime via nodejs_wheel ROOT_DIR).
+    "nodejs-wheel-binaries>=22.0.0",
 ]
 
 [project.optional-dependencies]

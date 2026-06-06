@@ -476,16 +476,41 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
 
     # ── CLI invocation ──────────────────────────────────────────────────
 
+    @staticmethod
+    def _bundled_node_bin() -> Path | None:
+        """Directory of the Node runtime bundled with this plugin via
+        nodejs-wheel-binaries (node/npm/npx live here). Returns None if the
+        wheel is unavailable. Keeps promptfoo self-contained — no Node on the
+        host/image required."""
+        try:
+            from nodejs_wheel.executable import ROOT_DIR
+        except Exception:
+            return None
+        bin_dir = Path(ROOT_DIR) / "bin"
+        return bin_dir if bin_dir.is_dir() else None
+
     def _resolve_promptfoo(self) -> list[str]:
+        # Prefer anything already on PATH (lets a host/image override win).
         binary = shutil.which("promptfoo")
         if binary:
             return [binary]
         npx = shutil.which("npx")
         if npx:
             return [npx, "-y", "promptfoo@latest"]
+        # Fall back to the Node bundled with the plugin (self-contained).
+        # Invoke npm's npx-cli.js with the bundled node directly: the bin/npx
+        # shim resolves its modules relative to its own path and breaks when
+        # called by absolute path, whereas `node .../npm/bin/npx-cli.js` works.
+        bundled = self._bundled_node_bin()
+        if bundled:
+            node = bundled / "node"
+            npx_cli = bundled.parent / "lib" / "node_modules" / "npm" / "bin" / "npx-cli.js"
+            if node.exists() and npx_cli.exists():
+                return [str(node), str(npx_cli), "-y", "promptfoo@latest"]
         raise RuntimeError(
-            "Neither `promptfoo` nor `npx` is installed in PATH. "
-            "Install Node.js + `npm i -g promptfoo` or run via `npx promptfoo`."
+            "No Node runtime available: `promptfoo`/`npx` not on PATH and the "
+            "bundled nodejs-wheel-binaries Node was not found. Reinstall the "
+            "plugin (it depends on nodejs-wheel-binaries)."
         )
 
     # ── Result aggregation ─────────────────────────────────────────────
@@ -607,6 +632,11 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         binary = self._resolve_promptfoo()
 
         env_vars = {**os.environ, **provider_env}
+        # Ensure the bundled Node is discoverable by promptfoo's own child
+        # processes (npx spawns `node`), so the run works with no Node on PATH.
+        bundled_bin = self._bundled_node_bin()
+        if bundled_bin:
+            env_vars["PATH"] = f"{bundled_bin}{os.pathsep}{env_vars.get('PATH', '')}"
         env_vars.setdefault("PROMPTFOO_DISABLE_TELEMETRY", "1")
         env_vars.setdefault("PROMPTFOO_DISABLE_UPDATE", "1")
         env_vars.setdefault("PROMPTFOO_DISABLE_SHARE_INFO", "1")
