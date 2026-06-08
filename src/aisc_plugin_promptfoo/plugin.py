@@ -6,18 +6,23 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Literal
 
+import pandas as pd
 import yaml
 from pydantic import BaseModel, Field
 
 from aisc_plugin_interface import (
     BaseEvaluationPlugin,
+    ChartType,
+    InputType,
     Measure,
+    MetricVisualization,
     PluginFeatureFlags,
     TaskProgress,
+    evaluation_input,
     metric,
-    ChartType,
-    MetricVisualization,
 )
+
+from .input_providers import RawBytesProvider
 
 
 Mode = Literal["eval", "redteam"]
@@ -91,16 +96,16 @@ ATTACK_CATEGORY = Literal[
     # Harm
     "harmful:violent-crime",
     "harmful:hate",
-    "harmful:sexual",
+    "harmful:sexual-content",
     "harmful:self-harm",
-    "harmful:weapons",
+    "harmful:indiscriminate-weapons",
     "harmful:cybercrime",
     "harmful:misinformation-disinformation",
-    # Bias
+    # Bias (promptfoo BIAS_PLUGINS = age/disability/gender/race; no `religion` plugin exists)
     "bias:gender",
     "bias:race",
     "bias:age",
-    "bias:religion",
+    "bias:disability",
     # Safety
     "excessive-agency",
     "hallucination",
@@ -129,18 +134,25 @@ class TestCase(BaseModel):
     description: str = Field(default="")
     vars: dict[str, str] = Field(
         default_factory=dict,
-        description="Variable substitutions for the prompt template (e.g. {question: 'What is 2+2?'}).",
+        description=(
+            "Values for the prompt template's placeholders, for example "
+            "{question: 'What is 2+2?'} fills in {{question}}."
+        ),
     )
     expected_contains: str = Field(
         default="",
-        description="Optional: response must contain this substring to pass.",
+        description="Optional. The response must contain this substring for the test to pass.",
     )
 
 
 class PromptfooConfig(BaseModel):
     mode: Mode = Field(
         default="redteam",
-        description="`eval` = functional tests against the LLM. `redteam` = automated adversarial security scan.",
+        description=(
+            "What kind of run this is. `eval` runs your own functional tests against the "
+            "model (you supply the prompts and assertions). `redteam` auto-generates "
+            "adversarial prompts and scans the model for safety and security issues."
+        ),
     )
 
     # ─── Target system ─────────────────────────────────────────────────────
@@ -148,31 +160,39 @@ class PromptfooConfig(BaseModel):
         default="ollama",
         title="Target provider",
         description=(
-            "Provider family of the system under test. Promptfoo needs this to build its "
-            "provider:model id (e.g. ollama:chat:..., anthropic:messages:..., openai:...). "
-            "Pick the family that matches the target model below."
+            "Which provider family the model under test belongs to. Promptfoo uses this to "
+            "build its provider:model id (for example ollama:chat:..., anthropic:messages:..., "
+            "openai:...). Pick the family that matches the target model below. `custom-http` "
+            "lets you point at any HTTP chat endpoint."
         ),
     )
     target_model: MODELS = Field(
         default="ollama_chat/llama3",
         title="Target model (under test)",
         description=(
-            "Model under test. Pick one whose family matches the provider above "
-            "(gpt-* -> openai, anthropic/* -> anthropic, gemini/* -> google, "
-            "ollama_chat/* -> ollama). The provider prefix is stripped automatically "
-            "for promptfoo's provider:model id."
+            "The model being tested. Pick one whose family matches the provider above "
+            "(gpt-* with openai, anthropic/* with anthropic, gemini/* with google, "
+            "ollama_chat/* with ollama). The provider prefix is just a hint for you and is "
+            "stripped before the model name is handed to promptfoo. Note: the mistral/* and "
+            "gemini/* entries only work if the matching provider exists, and a few of the "
+            "hosted ids may be dated, so prefer a current model id for your provider."
         ),
     )
     target_endpoint: str = Field(
         default="http://host.docker.internal:11434",
         description=(
-            "Endpoint URL. Required for `ollama` (e.g. `http://host.docker.internal:11434`) "
-            "and `custom-http` (full chat endpoint). Ignored for hosted providers."
+            "Endpoint URL for the model. Needed for `ollama` (for example "
+            "http://host.docker.internal:11434) and for `custom-http` (your full chat "
+            "endpoint). Hosted providers use their own API endpoint, so this is ignored there."
         ),
     )
     target_credential: str = Field(
         default="",
-        description="API key (for openai/anthropic/google). Leave blank for `ollama`/`custom-http`.",
+        description=(
+            "API key for the target. Used by openai, anthropic, and google (it maps to "
+            "OPENAI_API_KEY / ANTHROPIC_API_KEY / GOOGLE_API_KEY). Leave it blank for "
+            "`ollama` and `custom-http`. Secret, never shown in reports."
+        ),
     )
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     max_concurrency: int = Field(default=4, ge=1, le=32)
@@ -181,16 +201,19 @@ class PromptfooConfig(BaseModel):
     promptfoo_email: str = Field(
         default="",
         description=(
-            "Optional. Promptfoo CLI gates the redteam flow behind an email "
-            "verification prompt. Provide your email to bypass it non-interactively. "
-            "Leave blank for `eval` mode or to use a placeholder (`vera@localhost`)."
+            "Optional, redteam only. The promptfoo CLI asks for an email before running a "
+            "redteam. Put yours here to clear that prompt without any interaction. Leave it "
+            "blank and a placeholder (vera@localhost) is used. Not needed for eval mode."
         ),
     )
 
     # ─── Eval mode ────────────────────────────────────────────────────────
     prompts: list[str] = Field(
         default_factory=lambda: ["{{question}}"],
-        description="Prompt templates (use `{{var}}` placeholders).",
+        description=(
+            "Prompt templates sent to the model. Use `{{var}}` placeholders that match your "
+            "test variables (or CSV column headers), for example `{{question}}`."
+        ),
     )
     test_cases: list[TestCase] = Field(
         default_factory=lambda: [
@@ -201,26 +224,36 @@ class PromptfooConfig(BaseModel):
             ),
         ],
         description=(
-            "Test cases for `eval` mode. Each case binds variables + optional "
-            "expected substring. Must be non-empty in eval mode (promptfoo "
-            "produces zero results otherwise)."
+            "Inline test cases for eval mode. Each one sets the prompt variables plus an "
+            "optional expected substring. Eval mode needs at least one source of tests, so "
+            "either keep a test case here, or upload an eval-tests CSV instead (the CSV wins "
+            "if both are present)."
         ),
     )
     assertion_types: list[ASSERTION_TYPE] = Field(
         default_factory=lambda: ["llm-rubric", "is-refusal"],
-        description="Default assertions applied to every test case (combined with each test's `expected_contains`).",
+        description=(
+            "Assertions applied to every eval test, on top of each test's own "
+            "expected_contains. Only llm-rubric, is-refusal, and is-json are applied at this "
+            "shared level; contains, not-contains, icontains, regex, and similar are valid "
+            "promptfoo types but only make sense per-test, so they aren't written here."
+        ),
     )
     llm_rubric_criteria: str = Field(
         default="Response is accurate, helpful, and non-evasive.",
-        description="Rubric text for the `llm-rubric` assertion.",
+        description=(
+            "The rubric an LLM judge grades against when llm-rubric is in your assertions. "
+            "Describe what a good answer looks like."
+        ),
     )
 
     # ─── Redteam mode ─────────────────────────────────────────────────────
     purpose: str = Field(
         default="General-purpose chatbot.",
         description=(
-            "One-sentence description of what the system under test is supposed to do. "
-            "Promptfoo uses this to tailor adversarial prompts."
+            "A short description of what the model under test is meant to do. Promptfoo uses "
+            "this to make the generated attacks more relevant, so be specific (for example "
+            "'customer support bot for a bank')."
         ),
     )
     attack_categories: list[ATTACK_CATEGORY] = Field(
@@ -232,36 +265,55 @@ class PromptfooConfig(BaseModel):
             "harmbench",
         ],
         description=(
-            "Built-in adversarial categories. Promptfoo auto-generates the attack prompts. "
-            "Note: many `harmful:*`, `pii:*`, `bias:*`, and security categories require "
-            "promptfoo's cloud generation service (run `promptfoo auth login` first). "
-            "Locally-capable defaults: hallucination, politics, excessive-agency, "
-            "overreliance, imitation, donotanswer, harmbench, beavertails, xstest, toxic-chat."
+            "The adversarial categories to probe. Promptfoo generates the attack prompts for "
+            "each one. Heads up: many categories (most harmful:*, pii:*, bias:*, and the "
+            "security ones) rely on promptfoo's remote generation service, so they need cloud "
+            "access. Categories that run fully locally include hallucination, politics, "
+            "excessive-agency, overreliance, donotanswer, harmbench, beavertails, xstest, and "
+            "toxic-chat. Note beavertails is gated behind Hugging Face access."
         ),
     )
     strategies: list[STRATEGY] = Field(
         default_factory=lambda: ["basic"],
         description=(
-            "Attack delivery strategies. 'basic', 'base64', 'leetspeak', 'multilingual' run locally. "
-            "'jailbreak' requires promptfoo cloud or a self-hosted PROMPTFOO_REMOTE_GENERATION_URL."
+            "How the attack prompts are delivered. basic, base64, and leetspeak run locally. "
+            "multilingual still works but is deprecated upstream. jailbreak needs promptfoo "
+            "cloud or a self-hosted PROMPTFOO_REMOTE_GENERATION_URL, so it won't run fully offline."
         ),
     )
-    num_tests_per_category: int = Field(default=5, ge=1, le=50)
+    num_tests_per_category: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description="How many generated tests to run per attack category.",
+    )
     custom_adversarial_prompts: str = Field(
         default="",
         description=(
-            "Optional. One adversarial seed prompt per line. Adds the `intent` plugin so "
-            "promptfoo transforms each seed into a test case alongside the built-in attacks."
+            "Optional, redteam only. One seed prompt per line. Each seed is fed to promptfoo's "
+            "intent plugin, which turns it into a test case alongside the built-in attacks. "
+            "Use this to steer the redteam toward your own scenarios."
         ),
     )
 
     # ─── Escape hatch ─────────────────────────────────────────────────────
     raw_yaml: str = Field(
         default="",
-        description="Power-user: paste a complete promptfoo YAML. Overrides every other field above.",
+        description=(
+            "Power-user escape hatch: paste a complete promptfoo YAML and it's used verbatim. "
+            "This overrides everything else, including an uploaded eval-tests CSV and all the "
+            "fields above."
+        ),
     )
 
 
+@evaluation_input(
+    name="eval-tests-file",
+    label="Eval tests CSV (eval mode only)",
+    input_provider_class=RawBytesProvider,
+    input_type=InputType.DATASET,
+    required=False,
+)
 class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
     plugin_name = "Promptfoo"
     ui_icon = "policy"
@@ -269,15 +321,25 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
     form_ui_schema = {
         "target_model": {
             "ui:help": (
-                "Choose a model whose family matches the provider. ollama_chat/* are local "
-                "(set the endpoint above); the provider prefix is stripped automatically."
+                "Pick a model whose family matches the provider. ollama_chat/* models are "
+                "local, so set the endpoint above. The provider prefix is just a hint and is "
+                "stripped automatically."
             ),
         },
         "raw_yaml": {"ui:widget": "textarea", "ui:options": {"rows": 16}},
         "custom_adversarial_prompts": {"ui:widget": "textarea", "ui:options": {"rows": 6}},
         "prompts": {"ui:options": {"orderable": True}},
-        "test_cases": {"ui:options": {"orderable": True}},
-        "target_credential": {"ui:widget": "password"},
+        "test_cases": {
+            "ui:options": {"orderable": True},
+            "ui:help": (
+                "Eval mode only. Skipped if you upload an eval-tests CSV (the CSV takes "
+                "precedence)."
+            ),
+        },
+        "target_credential": {
+            "ui:widget": "password",
+            "ui:help": "API key for openai/anthropic/google. Leave blank for ollama/custom-http.",
+        },
     }
 
     @property
@@ -285,10 +347,13 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         return PluginFeatureFlags(can_parse_config_from_dataset=False)
 
     def get_metric_visualizations(self, config_data: dict) -> list[MetricVisualization]:
+        # One table of the aggregate KPIs (one row per KPI). The per-test detail
+        # is the "Per-run results" CSV, so we don't render long-format per-test rows.
         return [
             MetricVisualization(
                 chart_type=ChartType.TABLE,
-                metrics=["success", "score", "latency_ms", "cost", "refusal"]
+                metrics=["pass_rate", "fail_rate", "refusal_rate",
+                         "mean_latency_ms", "total_cost", "n_tests"],
             )
         ]
 
@@ -309,6 +374,19 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         "promptfoo_email",
     )
 
+    @staticmethod
+    def _drop_field(form_data, field: str) -> None:
+        """Delete a hidden field's value from form_data so stale input isn't
+        persisted once the field is no longer shown. Works for both a plain
+        dict and a pydantic-style object."""
+        if isinstance(form_data, dict):
+            form_data.pop(field, None)
+        elif form_data is not None and hasattr(form_data, field):
+            try:
+                delattr(form_data, field)
+            except (AttributeError, ValueError):
+                pass
+
     def on_config_change(self, form_data):
         schema, ui_schema = self.get_full_schema()
 
@@ -328,6 +406,8 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
                 required.remove(field)
             # Also hide via ui:widget if for any reason the field reappears.
             ui_schema.setdefault(field, {})["ui:widget"] = "hidden"
+            # Drop the stale value so a hidden field can't carry old input forward.
+            self._drop_field(form_data, field)
 
         # Handle provider-specific fields
         selected_provider = "ollama"
@@ -337,15 +417,17 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
             selected_provider = getattr(form_data, "target_provider", "ollama")
 
         if selected_provider in ("ollama", "custom-http"):
-            # Hide credential
+            # Hide the credential (these targets don't use an API key).
             if "target_credential" in required:
                 required.remove("target_credential")
             ui_schema.setdefault("target_credential", {})["ui:widget"] = "hidden"
+            self._drop_field(form_data, "target_credential")
         else:
-            # Hide endpoint
+            # Hide the endpoint (hosted providers have a fixed API endpoint).
             if "target_endpoint" in required:
                 required.remove("target_endpoint")
             ui_schema.setdefault("target_endpoint", {})["ui:widget"] = "hidden"
+            self._drop_field(form_data, "target_endpoint")
 
         return form_data, schema, ui_schema
 
@@ -403,7 +485,12 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
 
     # ── YAML composition ────────────────────────────────────────────────
 
-    def _build_eval_yaml(self, config: PromptfooConfig, provider: dict[str, Any]) -> dict[str, Any]:
+    def _build_eval_yaml(
+        self,
+        config: PromptfooConfig,
+        provider: dict[str, Any],
+        tests_csv_name: str | None = None,
+    ) -> dict[str, Any]:
         default_assertions: list[dict[str, Any]] = []
         for atype in config.assertion_types:
             if atype == "llm-rubric":
@@ -413,6 +500,23 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
             elif atype == "is-json":
                 default_assertions.append({"type": "is-json"})
             # text-substring/regex assertions only make sense per test; skip at default level
+
+        doc: dict[str, Any] = {
+            "description": "AISC Promptfoo eval",
+            "providers": [provider],
+            "prompts": config.prompts or ["{{prompt}}"],
+        }
+        if default_assertions:
+            doc["defaultTest"] = {"assert": default_assertions}
+
+        # Precedence (layered): raw_yaml > uploaded eval-tests CSV > inline test_cases.
+        # raw_yaml is handled upstream in _build_yaml (it never reaches here). If a CSV
+        # was uploaded, reference it and skip the inline test_cases loop entirely —
+        # promptfoo parses the CSV natively (rows = tests, headers = {{vars}},
+        # __expected*/__metadata:* etc.).
+        if tests_csv_name:
+            doc["tests"] = tests_csv_name
+            return doc
 
         tests_doc: list[dict[str, Any]] = []
         for t in config.test_cases:
@@ -427,13 +531,6 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
                 entry["assert"] = per_asserts
             tests_doc.append(entry)
 
-        doc: dict[str, Any] = {
-            "description": "AISC Promptfoo eval",
-            "providers": [provider],
-            "prompts": config.prompts or ["{{prompt}}"],
-        }
-        if default_assertions:
-            doc["defaultTest"] = {"assert": default_assertions}
         if tests_doc:
             doc["tests"] = tests_doc
         return doc
@@ -463,7 +560,9 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
             },
         }
 
-    def _build_yaml(self, config: PromptfooConfig) -> tuple[str, dict[str, str]]:
+    def _build_yaml(
+        self, config: PromptfooConfig, tests_csv_name: str | None = None
+    ) -> tuple[str, dict[str, str]]:
         if config.raw_yaml.strip():
             return config.raw_yaml, {}
 
@@ -471,7 +570,7 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         if config.mode == "redteam":
             doc = self._build_redteam_yaml(config, provider)
         else:
-            doc = self._build_eval_yaml(config, provider)
+            doc = self._build_eval_yaml(config, provider, tests_csv_name=tests_csv_name)
         return yaml.safe_dump(doc, sort_keys=False), env
 
     # ── CLI invocation ──────────────────────────────────────────────────
@@ -603,25 +702,187 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
             "by_category": category_breakdown,
         }
 
+    # ── Per-row CSV artifact ───────────────────────────────────────────
+
+    @staticmethod
+    def _truncate(text: Any, limit: int = 2000) -> str:
+        """Coerce a cell value to str and cap its length so the CSV stays usable.
+
+        Non-string outputs (dicts/lists from structured providers) are JSON-dumped
+        so the cell is still a readable string rather than a Python repr.
+        """
+        if text is None:
+            return ""
+        if not isinstance(text, str):
+            try:
+                text = json.dumps(text, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                text = str(text)
+        if len(text) > limit:
+            return text[: limit - 1] + "…"
+        return text
+
+    @staticmethod
+    def _assertions_summary(grading: dict) -> str:
+        """Compact per-assertion summary from gradingResult.componentResults[].
+
+        Each component is a GradingResult: { pass: bool, reason: str,
+        assertion: { type: str, value: any } }. Renders e.g.
+        ``is-refusal: pass; contains: fail (expected '4')``. The expected value
+        is only appended when the assertion failed and a value is present.
+        """
+        components = (grading or {}).get("componentResults") or []
+        parts: list[str] = []
+        for c in components:
+            if not isinstance(c, dict):
+                continue
+            assertion = c.get("assertion") or {}
+            a_type = assertion.get("type") if isinstance(assertion, dict) else None
+            a_type = a_type or "assert"
+            passed = c.get("pass")
+            verdict = "pass" if passed is True else "fail" if passed is False else "?"
+            seg = f"{a_type}: {verdict}"
+            if passed is False and isinstance(assertion, dict):
+                value = assertion.get("value")
+                if value not in (None, ""):
+                    value_str = value if isinstance(value, str) else json.dumps(value, default=str)
+                    if len(value_str) > 120:
+                        value_str = value_str[:119] + "…"
+                    seg += f" (expected {value_str!r})"
+            parts.append(seg)
+        return "; ".join(parts)
+
+    @classmethod
+    def _build_per_test_csv(cls, results_payload: dict, mode: str = "eval") -> str:
+        """Build the wide per-row results CSV (one row per test).
+
+        Parses promptfoo's native results JSON — ``results.results[]`` where each
+        element is an ``EvaluateResult`` with: ``prompt.raw`` (rendered prompt),
+        ``response.output`` (model text), ``vars``, ``success``, ``score``,
+        ``latencyMs``, ``cost``, and ``gradingResult.componentResults[]``. All key
+        access is defensive (falls back to "" / None) since field names vary by
+        promptfoo version. Redteam results share this shape; ``metadata.severity``
+        is appended as an extra column when present (prompt = adversarial probe).
+        """
+        results_array = results_payload.get("results", [])
+        if isinstance(results_array, dict):
+            results_array = results_array.get("results", [])
+
+        rows: list[dict[str, Any]] = []
+        any_severity = False
+        for idx, r in enumerate(results_array):
+            if not isinstance(r, dict):
+                continue
+            prompt_obj = r.get("prompt")
+            if isinstance(prompt_obj, dict):
+                prompt_raw = prompt_obj.get("raw") or prompt_obj.get("label") or ""
+            else:
+                prompt_raw = prompt_obj or ""
+
+            response_obj = r.get("response")
+            if isinstance(response_obj, dict):
+                output = response_obj.get("output")
+            else:
+                output = response_obj
+
+            grading = r.get("gradingResult") or {}
+            vars_obj = r.get("vars") or {}
+
+            row: dict[str, Any] = {
+                "test_index": r.get("testIdx", idx),
+                "prompt": cls._truncate(prompt_raw),
+                "response": cls._truncate(output),
+                "pass": r.get("success"),
+                "score": r.get("score"),
+                "assertions": cls._assertions_summary(grading),
+                "latency_ms": r.get("latencyMs"),
+                "cost": r.get("cost"),
+                "vars": cls._truncate(
+                    json.dumps(vars_obj, ensure_ascii=False, default=str)
+                ),
+            }
+
+            if mode == "redteam":
+                metadata = r.get("metadata") or {}
+                severity = metadata.get("severity") or (grading.get("metadata") or {}).get("severity")
+                if severity:
+                    any_severity = True
+                row["severity"] = severity or ""
+
+            rows.append(row)
+
+        columns = [
+            "test_index", "prompt", "response", "pass", "score",
+            "assertions", "latency_ms", "cost", "vars",
+        ]
+        if mode == "redteam" and any_severity:
+            columns.append("severity")
+
+        df = pd.DataFrame(rows, columns=columns)
+        return df.to_csv(index=False)
+
     # ── Main entrypoint ────────────────────────────────────────────────
 
     def evaluate(self, config_data: dict) -> Any:
         config = self.validate_config_form_data(config_data)
 
-        # Fail fast on a misconfigured `eval` run: without test cases there is
-        # no way for promptfoo to substitute template vars, so it produces
-        # zero results — confusing silent success. Force the user to add at
-        # least one test case OR switch to redteam mode.
-        if config.mode == "eval" and not config.raw_yaml.strip() and not config.test_cases:
+        workspace = Path(os.getcwd())
+
+        # ── Dataset source resolution (eval mode only) ────────────────────
+        # The core stack hands us the uploaded file as raw bytes (or None); the
+        # plugin decides whether to use it. Layered precedence, fail-loud only
+        # where it would otherwise silently do nothing:
+        #   raw_yaml  >  uploaded eval-tests CSV  >  inline test_cases
+        uploaded_bytes = self.get_input_data("eval-tests-file")  # bytes or None
+        tests_csv_name: str | None = None
+
+        if uploaded_bytes is not None and config.mode != "eval":
+            # Redteam is generative — there's no row dataset. Ignore the file
+            # rather than failing, and say so in the log.
+            self.logger.info(
+                "An eval-tests CSV was uploaded but mode is 'redteam'; ignoring it "
+                "(redteam generates its own adversarial tests). Switch to eval mode "
+                "to use the uploaded CSV."
+            )
+        elif uploaded_bytes is not None and config.mode == "eval":
+            if config.raw_yaml.strip():
+                # raw_yaml wins; the CSV is not referenced. Note it so the user
+                # isn't surprised their upload was skipped.
+                self.logger.info(
+                    "Both raw_yaml and an eval-tests CSV are present; raw_yaml takes "
+                    "precedence, so the uploaded CSV is ignored. Clear raw_yaml to use "
+                    "the CSV instead."
+                )
+            else:
+                # CSV wins over inline test_cases. Write it next to the config so
+                # promptfoo resolves `tests: tests.csv` relative to the config dir,
+                # and parses it natively (rows = tests, headers = {{vars}}).
+                tests_csv_name = "tests.csv"
+                (workspace / tests_csv_name).write_bytes(uploaded_bytes)
+                self.upload_artifact(tests_csv_name, uploaded_bytes)
+                if config.test_cases:
+                    self.logger.info(
+                        "An eval-tests CSV was uploaded; it takes precedence over the "
+                        "inline test_cases, which are ignored for this run."
+                    )
+
+        # Fail fast on a misconfigured `eval` run: with no tests at all, promptfoo
+        # has nothing to substitute template vars into and produces zero results —
+        # a confusing silent success. Accept ANY of: raw_yaml, an uploaded CSV, or
+        # at least one inline test_case.
+        if (
+            config.mode == "eval"
+            and not config.raw_yaml.strip()
+            and tests_csv_name is None
+            and not config.test_cases
+        ):
             raise RuntimeError(
-                "Eval mode requires at least one `test_cases` entry "
-                "(vars + optional expected_contains). Add a test case in "
-                "the config form, or switch `mode` to `redteam` for "
-                "auto-generated adversarial tests."
+                "Eval mode needs at least one test. Add a `test_cases` entry "
+                "(vars + optional expected_contains), upload an eval-tests CSV, "
+                "or switch `mode` to `redteam` for auto-generated adversarial tests."
             )
 
-        workspace = Path(os.getcwd())
-        config_yaml, provider_env = self._build_yaml(config)
+        config_yaml, provider_env = self._build_yaml(config, tests_csv_name=tests_csv_name)
         config_path = workspace / "promptfooconfig.yaml"
         config_path.write_text(config_yaml)
         self.upload_artifact("promptfooconfig.yaml", config_yaml.encode("utf-8"))
@@ -758,6 +1019,23 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         payload = json.loads(results_path.read_text())
         self.upload_artifact("promptfoo_results.json", results_path.read_bytes())
 
+        # Wide, scannable per-row CSV (one row per test) with the raw prompt and
+        # model response inline. Best-effort: a parse failure here must never sink
+        # an otherwise-successful eval, so it's logged and skipped. Redteam shares
+        # promptfoo's results shape (prompt = adversarial probe, plus severity).
+        try:
+            per_test_csv = self._build_per_test_csv(payload, mode=config.mode)
+            self.upload_artifact(
+                "promptfoo_per_test.csv", per_test_csv.encode("utf-8")
+            )
+        except Exception as exc:  # noqa: BLE001 - never break the eval on a CSV hiccup
+            self.logger.warning(
+                "Skipping promptfoo_per_test.csv artifact: failed to build the "
+                "per-row results CSV from the promptfoo results JSON (%s: %s).",
+                type(exc).__name__,
+                exc,
+            )
+
         agg = self._aggregate(payload)
         agg["mode"] = config.mode
 
@@ -790,86 +1068,49 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
             "strategy": str(t.get("strategy") or ""),
         }
 
-    @metric("success")
-    def success_metric(self, output: dict) -> list[Measure]:
-        mode = output.get("mode") or "eval"
-        measures: list[Measure] = []
-        for t in output.get("per_test", []):
-            success = t.get("success")
-            if success is None:
-                continue
-            measures.append(Measure(
-                name="success",
-                score=1.0 if success else 0.0,
-                unit="bool",
-                dimensions=self._test_dims(t, mode),
-                description="1.0 if test passed all assertions, else 0.0.",
-            ))
-        return measures
+    # Aggregate, single-valued KPIs (one value per run). These populate the Key
+    # Results scorecard and the summary table. The per-test breakdown is NOT
+    # emitted as metrics any more — it lives in the wide `promptfoo_per_test.csv`
+    # ("Per-run results"), so we don't repeat every test as long-format rows.
 
-    @metric("score")
-    def score_metric(self, output: dict) -> list[Measure]:
-        mode = output.get("mode") or "eval"
-        measures: list[Measure] = []
-        for t in output.get("per_test", []):
-            score = t.get("score")
-            if score is None:
-                continue
-            measures.append(Measure(
-                name="score",
-                score=float(score),
-                unit="score",
-                dimensions=self._test_dims(t, mode),
-                description="Raw assertion score reported by promptfoo for this test.",
-            ))
-        return measures
+    @metric("pass_rate")
+    def pass_rate_metric(self, output: dict) -> list[Measure]:
+        v = output.get("pass_rate")
+        if v is None:
+            return []
+        return [Measure(name="pass_rate", score=float(v), unit="rate (higher is better)",
+                        description="Share of tests that passed all of their assertions.")]
 
-    @metric("latency_ms")
-    def latency_metric(self, output: dict) -> list[Measure]:
-        mode = output.get("mode") or "eval"
-        measures: list[Measure] = []
-        for t in output.get("per_test", []):
-            latency = t.get("latencyMs")
-            if latency is None:
-                continue
-            measures.append(Measure(
-                name="latency_ms",
-                score=float(latency),
-                unit="ms",
-                dimensions=self._test_dims(t, mode),
-                description="Time the model took to respond on this test.",
-            ))
-        return measures
+    @metric("fail_rate")
+    def fail_rate_metric(self, output: dict) -> list[Measure]:
+        v = output.get("fail_rate")
+        if v is None:
+            return []
+        return [Measure(name="fail_rate", score=float(v), unit="rate (lower is better)",
+                        description="Share of tests that failed at least one assertion.")]
 
-    @metric("cost")
-    def cost_metric(self, output: dict) -> list[Measure]:
-        mode = output.get("mode") or "eval"
-        measures: list[Measure] = []
-        for t in output.get("per_test", []):
-            cost = t.get("cost")
-            if cost is None:
-                continue
-            measures.append(Measure(
-                name="cost",
-                score=float(cost),
-                unit="USD",
-                dimensions=self._test_dims(t, mode),
-                description="Per-test API cost in USD.",
-            ))
-        return measures
+    @metric("refusal_rate")
+    def refusal_rate_metric(self, output: dict) -> list[Measure]:
+        v = output.get("refusal_rate")
+        if v is None:
+            return []
+        return [Measure(name="refusal_rate", score=float(v), unit="rate",
+                        description="Share of tests where the model refused to answer.")]
 
-    @metric("refusal")
-    def refusal_metric(self, output: dict) -> list[Measure]:
-        mode = output.get("mode") or "eval"
-        measures: list[Measure] = []
-        for t in output.get("per_test", []):
-            reason = (t.get("reason") or "").lower()
-            refused = "refus" in reason
-            measures.append(Measure(
-                name="refusal",
-                score=1.0 if refused else 0.0,
-                unit="bool",
-                dimensions=self._test_dims(t, mode),
-                description="1.0 if the grading reason indicates the model refused, else 0.0.",
-            ))
-        return measures
+    @metric("mean_latency_ms")
+    def mean_latency_metric(self, output: dict) -> list[Measure]:
+        return [Measure(name="mean_latency_ms", score=float(output.get("mean_latency_ms") or 0.0),
+                        unit="ms (lower is better)",
+                        description="Average model response time across all tests.")]
+
+    @metric("total_cost")
+    def total_cost_metric(self, output: dict) -> list[Measure]:
+        return [Measure(name="total_cost", score=float(output.get("total_cost") or 0.0),
+                        unit="USD (lower is better)",
+                        description="Total API cost across all tests.")]
+
+    @metric("n_tests")
+    def n_tests_metric(self, output: dict) -> list[Measure]:
+        return [Measure(name="n_tests", score=float(output.get("n_tests") or 0),
+                        unit="count",
+                        description="Number of test cases run.")]
