@@ -1,3 +1,17 @@
+<!-- PLUGIN-FORK-BANNER -->
+> **AI Assessment Sandbox Configurator — plugin fork.**
+>
+> This repository is the plugin build of Promptfoo: the original Promptfoo project, forked and extended
+> with the integration layer (plugin hooks plus the mapping of Promptfoo's outputs to the Configurator's
+> shared data model) so it can be installed and run as a plugin in the generated sandbox environment. The plugin-specific
+> code and configuration live alongside the upstream sources.
+>
+> **Everything below the line is the original, unmodified Promptfoo README.**
+
+---
+
+<!-- ===== ORIGINAL Promptfoo README BELOW ===== -->
+
 # Promptfoo: LLM evals & red teaming
 
 <p align="center">
