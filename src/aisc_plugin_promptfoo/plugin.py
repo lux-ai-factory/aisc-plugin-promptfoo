@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 import pandas as pd
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from aisc_plugin_interface import (
     BaseEvaluationPlugin,
@@ -65,6 +65,14 @@ TARGET_PROVIDER = Literal[
     "anthropic",
     "google",
     "custom-http",
+]
+
+GENERATION_PROVIDER_TYPE = Literal[
+    "same_as_target",
+    "openai",
+    "anthropic",
+    "google",
+    "ollama",
 ]
 
 ASSERTION_TYPE = Literal[
@@ -145,6 +153,44 @@ class TestCase(BaseModel):
     )
 
 
+class ContextModel(BaseModel):
+    """A named execution context for redteam — prompts are generated for each context."""
+    id: str = Field(
+        description="Unique, nonempty identifier for this context."
+    )
+    purpose: str = Field(
+        default="",
+        description="Optional context-specific system description, overrides the top-level purpose.",
+    )
+    vars: dict[str, str] = Field(
+        default_factory=dict,
+        description="Variables injected into target requests for this context.",
+    )
+
+    @field_validator("id")
+    @classmethod
+    def id_nonempty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Context id must not be blank.")
+        return v.strip()
+
+
+class GraderExampleModel(BaseModel):
+    """A grading example that calibrates the LLM judge used to score redteam results."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    output: str = Field(description="Example model response text.")
+    # "pass" is a Python reserved word; serialise as the upstream key.
+    pass_result: bool = Field(
+        alias="pass",
+        serialization_alias="pass",
+        default=True,
+        description="Whether this response should be graded as passing.",
+    )
+    score: float = Field(default=1.0, ge=0.0, le=1.0)
+    reason: str = Field(default="", description="Explanation of the grading decision.")
+
+
 class PromptfooConfig(BaseModel):
     mode: Mode = Field(
         default="redteam",
@@ -175,7 +221,8 @@ class PromptfooConfig(BaseModel):
             "ollama_chat/* with ollama). The provider prefix is just a hint for you and is "
             "stripped before the model name is handed to promptfoo. Note: the mistral/* and "
             "gemini/* entries only work if the matching provider exists, and a few of the "
-            "hosted ids may be dated, so prefer a current model id for your provider."
+            "hosted ids may be dated, so prefer a current model id for your provider. "
+            "Hidden for custom-http (the endpoint controls its own model)."
         ),
     )
     target_endpoint: str = Field(
@@ -183,19 +230,59 @@ class PromptfooConfig(BaseModel):
         description=(
             "Endpoint URL for the model. Needed for `ollama` (for example "
             "http://host.docker.internal:11434) and for `custom-http` (your full chat "
-            "endpoint). Hosted providers use their own API endpoint, so this is ignored there."
+            "endpoint URL, for example http://host.docker.internal:8766/chat). "
+            "Hosted providers use their own API endpoint, so this is ignored there."
         ),
     )
     target_credential: str = Field(
         default="",
         description=(
             "API key for the target. Used by openai, anthropic, and google (it maps to "
-            "OPENAI_API_KEY / ANTHROPIC_API_KEY / GOOGLE_API_KEY). Leave it blank for "
-            "`ollama` and `custom-http`. Secret, never shown in reports."
+            "OPENAI_API_KEY / ANTHROPIC_API_KEY / GOOGLE_API_KEY). For custom-http, it is "
+            "sent as a Bearer token in the Authorization header when non-empty. "
+            "Leave it blank for `ollama` and unauthenticated `custom-http`. Secret, never shown in reports."
         ),
     )
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    max_concurrency: int = Field(default=4, ge=1, le=32)
+    temperature: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature for LLM providers. Hidden for custom-http.",
+    )
+    max_concurrency: int = Field(
+        default=4,
+        ge=1,
+        le=32,
+        description="Maximum concurrent requests during evaluation (promptfoo eval --max-concurrency).",
+    )
+
+    # ─── Custom-HTTP request/response mapping ────────────────────────────────
+    http_body_template: str = Field(
+        default='{"message": "{{prompt}}", "language": "en"}',
+        title="HTTP request body (JSON)",
+        description=(
+            "JSON object sent as the request body for custom-http targets. Use `{{prompt}}` "
+            "as the placeholder where the adversarial/eval prompt is injected. "
+            "Example for the AISC leaderboard: "
+            '{"message": "{{prompt}}", "language": "en"} — '
+            "the `language` field here controls what language the request is sent in; "
+            "it is separate from the redteam `languages` setting, which controls the "
+            "language the attack prompts are generated in. Set both consistently."
+        ),
+    )
+    http_response_transform: str = Field(
+        default='json.replies ? json.replies.join("\\n") : (json.response || output)',
+        title="HTTP response extraction (JS expression)",
+        description=(
+            "A JavaScript expression evaluated by promptfoo to extract the model's reply "
+            "from the HTTP response. Available variables: `json` (parsed response body), "
+            "`output` (raw response string), `context` (headers, status). "
+            "AISC leaderboard default extracts the first string in `replies[]` or falls back "
+            "to a top-level `response` field: "
+            'json.replies ? json.replies.join("\\n") : (json.response || output). '
+            "For a plain `{response: '...'}` shape, use: json.response || output."
+        ),
+    )
 
     # ─── Promptfoo account (redteam only) ─────────────────────────────────
     promptfoo_email: str = Field(
@@ -204,6 +291,45 @@ class PromptfooConfig(BaseModel):
             "Optional, redteam only. The promptfoo CLI asks for an email before running a "
             "redteam. Put yours here to clear that prompt without any interaction. Leave it "
             "blank and a placeholder (vera@localhost) is used. Not needed for eval mode."
+        ),
+    )
+
+    # ─── Attack-generation / grading provider (redteam only) ─────────────
+    generation_provider_type: GENERATION_PROVIDER_TYPE = Field(
+        default="same_as_target",
+        title="Attack-generation provider",
+        description=(
+            "The LLM used to generate adversarial prompts and grade results. "
+            "Distinct from the target being tested. "
+            "`same_as_target` reuses the target provider and is suitable for openai/anthropic/"
+            "google/ollama targets. For `custom-http` targets the HTTP endpoint cannot generate "
+            "attacks, so choose a real LLM here (e.g. openai or anthropic) and supply an API key below."
+        ),
+    )
+    generation_model: str = Field(
+        default="gpt-4o-mini",
+        title="Generation model",
+        description=(
+            "Model id for the attack-generation provider. Examples: gpt-4o-mini (openai), "
+            "claude-3-5-haiku-20241022 (anthropic), gemini-2.0-flash-001 (google), "
+            "llama3 (ollama). Ignored when generation_provider_type is same_as_target."
+        ),
+    )
+    generation_credential: str = Field(
+        default="",
+        title="Generation provider API key",
+        description=(
+            "API key for the attack-generation provider (openai → OPENAI_API_KEY, "
+            "anthropic → ANTHROPIC_API_KEY, google → GOOGLE_API_KEY). "
+            "Ignored when generation_provider_type is same_as_target. Secret, never shown in reports."
+        ),
+    )
+    generation_endpoint: str = Field(
+        default="http://host.docker.internal:11434",
+        title="Generation provider endpoint (ollama only)",
+        description=(
+            "Base URL for the ollama generation provider, e.g. http://host.docker.internal:11434. "
+            "Only used when generation_provider_type is ollama."
         ),
     )
 
@@ -296,15 +422,133 @@ class PromptfooConfig(BaseModel):
         ),
     )
 
+    # ─── Redteam advanced options ──────────────────────────────────────────
+    languages: list[str] = Field(
+        default_factory=lambda: ["en"],
+        title="Attack languages",
+        description=(
+            "Languages used to generate adversarial test messages (IETF language tags such as "
+            "en, fr, de, lb). Promptfoo maps this to redteam.language in the YAML. "
+            "A single entry is written as a string; multiple entries as a list. "
+            "Note: this controls the language of the *generated attack prompts*. For "
+            "custom-http targets you must also update the http_body_template `language` field "
+            "to control the language of the actual HTTP request payload."
+        ),
+    )
+    frameworks: list[str] = Field(
+        default_factory=list,
+        title="Compliance frameworks",
+        description=(
+            "Framework ids to include in promptfoo reports (e.g. owasp:llm, owasp:agentic, "
+            "eu:ai-act). Omitted when empty, which includes all frameworks supported by the "
+            "installed promptfoo version. This is a display/filter setting only — it does not "
+            "automatically select attack categories or establish compliance."
+        ),
+    )
+    test_generation_instructions: str = Field(
+        default="",
+        title="Test-generation instructions",
+        description=(
+            "Free-text guidance added to promptfoo's attack-generation system prompt "
+            "(redteam.testGenerationInstructions). Use this to focus attacks on your domain, "
+            "e.g. 'Focus on a database-backed model leaderboard. Use realistic requests "
+            "involving rankings, comparisons, and filters.' Omitted when blank."
+        ),
+    )
+    generation_delay_ms: int = Field(
+        default=0,
+        ge=0,
+        title="Generation delay (milliseconds)",
+        description=(
+            "Milliseconds to wait between attack-generation requests "
+            "(redteam.delay). Affects only the generation phase, not evaluation. "
+            "When greater than zero, generation effectively runs at concurrency 1 "
+            "(generation_max_concurrency is forced to 1 in the CLI invocation)."
+        ),
+    )
+    generation_max_concurrency: int = Field(
+        default=4,
+        ge=1,
+        le=32,
+        title="Generation max concurrency",
+        description=(
+            "Maximum concurrent requests during attack generation "
+            "(redteam.maxConcurrency / --max-concurrency on redteam generate). "
+            "Separate from max_concurrency, which controls evaluation concurrency. "
+            "Set to 1 when targeting a slow or rate-limited endpoint such as the leaderboard. "
+            "Automatically forced to 1 when generation_delay_ms > 0."
+        ),
+    )
+    max_chars_per_message: int | None = Field(
+        default=None,
+        ge=1,
+        title="Max characters per message",
+        description=(
+            "Truncates generated attack prompts to this many characters "
+            "(redteam.maxCharsPerMessage). Omitted when null."
+        ),
+    )
+    inject_var: str = Field(
+        default="",
+        title="Inject variable",
+        description=(
+            "The prompt template variable that receives adversarial input "
+            "(redteam.injectVar). Omitted when blank so promptfoo infers it from the "
+            "target configuration. For single-input templates this inference is reliable. "
+            "Provide an explicit value (e.g. question or message) only for multi-variable "
+            "templates where the inference might be ambiguous."
+        ),
+    )
+    contexts: list[ContextModel] = Field(
+        default_factory=list,
+        title="Redteam contexts",
+        description=(
+            "Named execution contexts for the redteam run (redteam.contexts). Each context "
+            "generates an independent set of attack cases, which can surface context-sensitive "
+            "vulnerabilities. Context variables are only injected into target requests when the "
+            "target mapping actually references them. IDs must be unique and nonempty."
+        ),
+    )
+    grader_examples: list[GraderExampleModel] = Field(
+        default_factory=list,
+        title="Grader examples",
+        description=(
+            "Global grading calibration examples (redteam.graderExamples). Each example "
+            "shows the LLM judge a model response and the expected pass/fail verdict. "
+            "Use this to teach the judge your domain-specific acceptance criteria."
+        ),
+    )
+
     # ─── Escape hatch ─────────────────────────────────────────────────────
     raw_yaml: str = Field(
         default="",
         description=(
             "Power-user escape hatch: paste a complete promptfoo YAML and it's used verbatim. "
-            "This overrides everything else, including an uploaded eval-tests CSV and all the "
-            "fields above."
+            "This overrides ALL other fields, including an uploaded eval-tests CSV. "
+            "The AISC `mode` field still controls whether `promptfoo eval` or "
+            "`promptfoo redteam generate + eval` is invoked, so ensure your YAML contains "
+            "the matching key (`providers`/`tests` for eval; `targets`/`redteam` for redteam). "
+            "A YAML that contains `redteam:` with mode set to `eval` will be flagged."
         ),
     )
+
+    @field_validator("languages")
+    @classmethod
+    def languages_nonempty(cls, v: list[str]) -> list[str]:
+        cleaned = list(dict.fromkeys(lang.strip() for lang in v if lang.strip()))
+        return cleaned if cleaned else ["en"]
+
+    @model_validator(mode="after")
+    def warn_http_generation(self) -> "PromptfooConfig":
+        if (
+            self.mode == "redteam"
+            and self.target_provider == "custom-http"
+            and self.generation_provider_type == "same_as_target"
+        ):
+            # Not an error — but the caller (_build_generation_provider) will emit
+            # a warning. Keeping the model validator clean to avoid surprises.
+            pass
+        return self
 
 
 @evaluation_input(
@@ -323,11 +567,27 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
             "ui:help": (
                 "Pick a model whose family matches the provider. ollama_chat/* models are "
                 "local, so set the endpoint above. The provider prefix is just a hint and is "
-                "stripped automatically."
+                "stripped automatically. Hidden for custom-http."
+            ),
+        },
+        "http_body_template": {
+            "ui:widget": "textarea",
+            "ui:options": {"rows": 4},
+            "ui:help": (
+                "JSON object for the HTTP request body. Use {{prompt}} where the "
+                "adversarial or eval prompt should be injected."
+            ),
+        },
+        "http_response_transform": {
+            "ui:widget": "textarea",
+            "ui:options": {"rows": 2},
+            "ui:help": (
+                "JavaScript expression to extract the model's reply from the HTTP response."
             ),
         },
         "raw_yaml": {"ui:widget": "textarea", "ui:options": {"rows": 16}},
         "custom_adversarial_prompts": {"ui:widget": "textarea", "ui:options": {"rows": 6}},
+        "test_generation_instructions": {"ui:widget": "textarea", "ui:options": {"rows": 5}},
         "prompts": {"ui:options": {"orderable": True}},
         "test_cases": {
             "ui:options": {"orderable": True},
@@ -338,7 +598,25 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         },
         "target_credential": {
             "ui:widget": "password",
-            "ui:help": "API key for openai/anthropic/google. Leave blank for ollama/custom-http.",
+            "ui:help": "API key for openai/anthropic/google. Leave blank for ollama/custom-http (or enter Bearer token for custom-http).",
+        },
+        "generation_credential": {
+            "ui:widget": "password",
+            "ui:help": "API key for the attack-generation provider. Required when generation_provider_type is not same_as_target.",
+        },
+        "generation_model": {
+            "ui:help": "Model id for the attack-generation provider, e.g. gpt-4o-mini, claude-3-5-haiku-20241022.",
+        },
+        "contexts": {
+            "ui:help": "Named contexts generate independent attack sets. IDs must be unique.",
+        },
+        "grader_examples": {
+            "ui:help": "Calibration examples for the LLM judge. Use 'pass' (the upstream YAML key) in the serialized form.",
+            "items": {
+                "pass_result": {
+                    "ui:title": "pass",
+                },
+            },
         },
     }
 
@@ -372,13 +650,39 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         "num_tests_per_category",
         "custom_adversarial_prompts",
         "promptfoo_email",
+        "generation_provider_type",
+        "generation_model",
+        "generation_credential",
+        "generation_endpoint",
+        "languages",
+        "frameworks",
+        "test_generation_instructions",
+        "generation_delay_ms",
+        "generation_max_concurrency",
+        "max_chars_per_message",
+        "inject_var",
+        "contexts",
+        "grader_examples",
+    )
+    # Fields specific to custom-http target
+    HTTP_ONLY_FIELDS = (
+        "http_body_template",
+        "http_response_transform",
+    )
+    # Fields hidden for custom-http (endpoint controls its own model)
+    NON_HTTP_TARGET_FIELDS = (
+        "target_model",
+        "temperature",
+    )
+    # Generation-provider sub-fields hidden when same_as_target
+    GENERATION_DETAIL_FIELDS = (
+        "generation_model",
+        "generation_credential",
+        "generation_endpoint",
     )
 
     @staticmethod
     def _drop_field(form_data, field: str) -> None:
-        """Delete a hidden field's value from form_data so stale input isn't
-        persisted once the field is no longer shown. Works for both a plain
-        dict and a pydantic-style object."""
         if isinstance(form_data, dict):
             form_data.pop(field, None)
         elif form_data is not None and hasattr(form_data, field):
@@ -396,98 +700,186 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         elif form_data is not None:
             selected_mode = getattr(form_data, "mode", "redteam")
 
-        props = schema.get("properties", {})
-        required = schema.get("required", [])
-        hide = self.EVAL_ONLY_FIELDS if selected_mode == "redteam" else self.REDTEAM_ONLY_FIELDS
-
-        for field in hide:
-            props.pop(field, None)
-            if field in required:
-                required.remove(field)
-            # Also hide via ui:widget if for any reason the field reappears.
-            ui_schema.setdefault(field, {})["ui:widget"] = "hidden"
-            # Drop the stale value so a hidden field can't carry old input forward.
-            self._drop_field(form_data, field)
-
-        # Handle provider-specific fields
         selected_provider = "ollama"
         if isinstance(form_data, dict):
             selected_provider = form_data.get("target_provider") or "ollama"
         elif form_data is not None:
             selected_provider = getattr(form_data, "target_provider", "ollama")
 
+        selected_gen_type = "same_as_target"
+        if isinstance(form_data, dict):
+            selected_gen_type = form_data.get("generation_provider_type") or "same_as_target"
+        elif form_data is not None:
+            selected_gen_type = getattr(form_data, "generation_provider_type", "same_as_target")
+
+        props = schema.get("properties", {})
+        required = schema.get("required", [])
+
+        def _hide(field: str) -> None:
+            props.pop(field, None)
+            if field in required:
+                required.remove(field)
+            ui_schema.setdefault(field, {})["ui:widget"] = "hidden"
+            self._drop_field(form_data, field)
+
+        # Mode-based visibility
+        hide_for_mode = self.EVAL_ONLY_FIELDS if selected_mode == "redteam" else self.REDTEAM_ONLY_FIELDS
+        for field in hide_for_mode:
+            _hide(field)
+
+        # Provider-based visibility
+        if selected_provider == "custom-http":
+            for field in self.NON_HTTP_TARGET_FIELDS:
+                _hide(field)
+        else:
+            for field in self.HTTP_ONLY_FIELDS:
+                _hide(field)
+
         if selected_provider in ("ollama", "custom-http"):
-            # Hide the credential (these targets don't use an API key).
             if "target_credential" in required:
                 required.remove("target_credential")
             ui_schema.setdefault("target_credential", {})["ui:widget"] = "hidden"
             self._drop_field(form_data, "target_credential")
         else:
-            # Hide the endpoint (hosted providers have a fixed API endpoint).
             if "target_endpoint" in required:
                 required.remove("target_endpoint")
             ui_schema.setdefault("target_endpoint", {})["ui:widget"] = "hidden"
             self._drop_field(form_data, "target_endpoint")
 
+        # Generation-provider sub-fields visibility (redteam mode only)
+        if selected_mode == "redteam" and selected_gen_type == "same_as_target":
+            for field in self.GENERATION_DETAIL_FIELDS:
+                _hide(field)
+        if selected_mode == "redteam" and selected_gen_type != "ollama":
+            _hide("generation_endpoint")
+
         return form_data, schema, ui_schema
 
     # ── Provider building ────────────────────────────────────────────────
 
-    def _build_provider(self, config: PromptfooConfig) -> tuple[dict[str, Any], dict[str, str]]:
+    def _build_provider(self, config: "PromptfooConfig") -> tuple[dict[str, Any], dict[str, str]]:
         """Return (provider_dict, extra_env_vars) for the chosen target."""
         env: dict[str, str] = {}
         provider_id: str
-        provider_cfg: dict[str, Any] = {"temperature": config.temperature}
+        provider_cfg: dict[str, Any]
 
-        # Curated dropdown values are provider-prefixed; promptfoo wants a bare
-        # model name in its own provider:model id, so strip the prefix here.
         model = _bare_model(config.target_model)
 
         if config.target_provider == "ollama":
             provider_id = f"ollama:chat:{model or 'llama3:latest'}"
+            provider_cfg = {"temperature": config.temperature}
             host = (config.target_endpoint or "http://host.docker.internal:11434").rstrip("/")
-            # Strip trailing /v1 (promptfoo's ollama provider points at the base API).
             if host.endswith("/v1"):
                 host = host[:-3].rstrip("/")
             env["OLLAMA_BASE_URL"] = host
         elif config.target_provider == "openai":
             provider_id = f"openai:{model or 'gpt-4o-mini'}"
+            provider_cfg = {"temperature": config.temperature}
             if config.target_credential:
                 env["OPENAI_API_KEY"] = config.target_credential
             if config.target_endpoint:
                 env["OPENAI_BASE_URL"] = config.target_endpoint.rstrip("/")
         elif config.target_provider == "anthropic":
             provider_id = f"anthropic:messages:{model or 'claude-3-5-sonnet-20241022'}"
+            provider_cfg = {"temperature": config.temperature}
             if config.target_credential:
                 env["ANTHROPIC_API_KEY"] = config.target_credential
         elif config.target_provider == "google":
             provider_id = f"google:{model or 'gemini-1.5-flash'}"
+            provider_cfg = {"temperature": config.temperature}
             if config.target_credential:
                 env["GOOGLE_API_KEY"] = config.target_credential
                 env.setdefault("GEMINI_API_KEY", config.target_credential)
         elif config.target_provider == "custom-http":
             provider_id = "http"
+            # Parse the body template from JSON so promptfoo sees a native object
+            # (not a raw string). {{prompt}} is a promptfoo template placeholder, not
+            # a Jinja variable, so it round-trips through json.loads correctly.
+            try:
+                body = json.loads(config.http_body_template)
+            except (json.JSONDecodeError, TypeError):
+                body = config.http_body_template  # fall back to raw string
+            headers: dict[str, str] = {"Content-Type": "application/json"}
+            if config.target_credential:
+                headers["Authorization"] = f"Bearer {config.target_credential}"
             provider_cfg = {
                 "url": config.target_endpoint,
                 "method": "POST",
-                "headers": (
-                    {"Authorization": f"Bearer {config.target_credential}"}
-                    if config.target_credential
-                    else {}
-                ),
-                "body": {"prompt": "{{prompt}}"},
-                "transformResponse": "json.response || json.output || output",
+                "headers": headers,
+                "body": body,
+                "transformResponse": config.http_response_transform,
             }
         else:
             raise ValueError(f"Unknown target_provider: {config.target_provider}")
 
         return {"id": provider_id, "config": provider_cfg}, env
 
+    def _build_generation_provider(
+        self, config: "PromptfooConfig"
+    ) -> tuple[str | dict[str, Any] | None, dict[str, str]]:
+        """Build the attack-generation / grading provider config.
+
+        Returns (provider, extra_env). `provider` is either a string id (for
+        simple LLM providers), a full config dict (for ollama with a custom
+        endpoint), or None (when promptfoo should use its own default).
+
+        For non-custom-http targets with same_as_target, the target provider id
+        string is reused directly — promptfoo can use any LLM provider for
+        generation, not just the target.
+
+        For custom-http targets with same_as_target, the HTTP endpoint cannot
+        generate attacks; a warning is logged and None is returned so promptfoo
+        falls back to its built-in default (requires a PROMPTFOO_OPENAI_API_KEY
+        or equivalent in the environment).
+        """
+        gen_type = config.generation_provider_type
+        env: dict[str, str] = {}
+
+        if gen_type == "same_as_target":
+            if config.target_provider == "custom-http":
+                self.logger.warning(
+                    "generation_provider_type is 'same_as_target' but target_provider is "
+                    "'custom-http'. An HTTP endpoint cannot generate adversarial prompts. "
+                    "Set generation_provider_type to openai/anthropic/google/ollama and "
+                    "supply an API key in generation_credential. Falling back to promptfoo's "
+                    "built-in default generation provider (requires OPENAI_API_KEY in env)."
+                )
+                return None, env
+            # Reuse the target provider id string for generation.
+            target_provider, _ = self._build_provider(config)
+            return target_provider["id"], env
+
+        # Explicit generation provider
+        gen_model = (config.generation_model or "gpt-4o-mini").strip()
+        if gen_type == "openai":
+            provider: str | dict[str, Any] = f"openai:{gen_model}"
+            if config.generation_credential:
+                env["OPENAI_API_KEY"] = config.generation_credential
+        elif gen_type == "anthropic":
+            provider = f"anthropic:messages:{gen_model}"
+            if config.generation_credential:
+                env["ANTHROPIC_API_KEY"] = config.generation_credential
+        elif gen_type == "google":
+            provider = f"google:{gen_model}"
+            if config.generation_credential:
+                env["GOOGLE_API_KEY"] = config.generation_credential
+                env.setdefault("GEMINI_API_KEY", config.generation_credential)
+        elif gen_type == "ollama":
+            host = (config.generation_endpoint or "http://host.docker.internal:11434").rstrip("/")
+            if host.endswith("/v1"):
+                host = host[:-3].rstrip("/")
+            env["OLLAMA_BASE_URL"] = host
+            provider = f"ollama:chat:{gen_model}"
+        else:
+            raise ValueError(f"Unknown generation_provider_type: {gen_type}")
+
+        return provider, env
+
     # ── YAML composition ────────────────────────────────────────────────
 
     def _build_eval_yaml(
         self,
-        config: PromptfooConfig,
+        config: "PromptfooConfig",
         provider: dict[str, Any],
         tests_csv_name: str | None = None,
     ) -> dict[str, Any]:
@@ -499,7 +891,6 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
                 default_assertions.append({"type": "is-refusal"})
             elif atype == "is-json":
                 default_assertions.append({"type": "is-json"})
-            # text-substring/regex assertions only make sense per test; skip at default level
 
         doc: dict[str, Any] = {
             "description": "AISC Promptfoo eval",
@@ -509,11 +900,6 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         if default_assertions:
             doc["defaultTest"] = {"assert": default_assertions}
 
-        # Precedence (layered): raw_yaml > uploaded eval-tests CSV > inline test_cases.
-        # raw_yaml is handled upstream in _build_yaml (it never reaches here). If a CSV
-        # was uploaded, reference it and skip the inline test_cases loop entirely —
-        # promptfoo parses the CSV natively (rows = tests, headers = {{vars}},
-        # __expected*/__metadata:* etc.).
         if tests_csv_name:
             doc["tests"] = tests_csv_name
             return doc
@@ -535,7 +921,12 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
             doc["tests"] = tests_doc
         return doc
 
-    def _build_redteam_yaml(self, config: PromptfooConfig, provider: dict[str, Any]) -> dict[str, Any]:
+    def _build_redteam_yaml(
+        self,
+        config: "PromptfooConfig",
+        provider: dict[str, Any],
+        generation_provider: str | dict[str, Any] | None,
+    ) -> dict[str, Any]:
         plugin_list: list[Any] = list(config.attack_categories)
         custom_intents = [
             line.strip()
@@ -545,30 +936,98 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         if custom_intents:
             plugin_list.append({"id": "intent", "config": {"intent": custom_intents}})
 
+        redteam_cfg: dict[str, Any] = {
+            "purpose": config.purpose,
+            "numTests": config.num_tests_per_category,
+            "plugins": plugin_list,
+            "strategies": list(config.strategies),
+        }
+
+        # Attack-generation provider — must be an LLM, not the HTTP target.
+        # Pass the full provider dict when it carries a config (e.g. ollama),
+        # or just the string id for simple API providers.
+        if generation_provider is not None:
+            redteam_cfg["provider"] = generation_provider
+
+        # Languages (string when single, list when multiple)
+        languages = [l for l in config.languages if l.strip()]
+        if languages:
+            redteam_cfg["language"] = languages[0] if len(languages) == 1 else languages
+
+        if config.frameworks:
+            redteam_cfg["frameworks"] = list(config.frameworks)
+
+        if config.test_generation_instructions.strip():
+            redteam_cfg["testGenerationInstructions"] = config.test_generation_instructions.strip()
+
+        if config.generation_delay_ms > 0:
+            redteam_cfg["delay"] = config.generation_delay_ms
+
+        # Always write maxConcurrency so the generation phase honours the field.
+        # (The CLI --max-concurrency flag on redteam generate overlaps with
+        # redteam.maxConcurrency; the YAML key takes precedence when both present.)
+        effective_gen_concurrency = config.generation_max_concurrency
+        if config.generation_delay_ms > 0:
+            effective_gen_concurrency = 1
+        redteam_cfg["maxConcurrency"] = effective_gen_concurrency
+
+        if config.max_chars_per_message is not None:
+            redteam_cfg["maxCharsPerMessage"] = config.max_chars_per_message
+
+        if config.inject_var.strip():
+            redteam_cfg["injectVar"] = config.inject_var.strip()
+
+        if config.contexts:
+            ctx_list: list[dict[str, Any]] = []
+            for c in config.contexts:
+                ctx: dict[str, Any] = {"id": c.id}
+                if c.purpose.strip():
+                    ctx["purpose"] = c.purpose.strip()
+                if c.vars:
+                    ctx["vars"] = c.vars
+                ctx_list.append(ctx)
+            redteam_cfg["contexts"] = ctx_list
+
+        if config.grader_examples:
+            redteam_cfg["graderExamples"] = [
+                {
+                    "output": g.output,
+                    "pass": g.pass_result,
+                    "score": g.score,
+                    "reason": g.reason,
+                }
+                for g in config.grader_examples
+            ]
+
         return {
             "description": "AISC Promptfoo redteam",
             "targets": [provider],
-            "redteam": {
-                "purpose": config.purpose,
-                "numTests": config.num_tests_per_category,
-                # Force the attack generator to use the user's target provider
-                # so everything stays local (avoids promptfoo cloud + email
-                # verification gate).
-                "provider": provider["id"],
-                "plugins": plugin_list,
-                "strategies": list(config.strategies),
-            },
+            "redteam": redteam_cfg,
         }
 
     def _build_yaml(
-        self, config: PromptfooConfig, tests_csv_name: str | None = None
+        self, config: "PromptfooConfig", tests_csv_name: str | None = None
     ) -> tuple[str, dict[str, str]]:
         if config.raw_yaml.strip():
+            # Detect obvious mode/content mismatch so the user gets an actionable error.
+            raw_lower = config.raw_yaml.lower()
+            if config.mode == "eval" and "redteam:" in raw_lower:
+                raise RuntimeError(
+                    "mode is 'eval' but raw_yaml contains a 'redteam:' key. "
+                    "Either switch mode to 'redteam' or remove the redteam block from raw_yaml."
+                )
+            if config.mode == "redteam" and "redteam:" not in raw_lower:
+                raise RuntimeError(
+                    "mode is 'redteam' but raw_yaml has no 'redteam:' key. "
+                    "Either switch mode to 'eval' or add a redteam block to raw_yaml."
+                )
             return config.raw_yaml, {}
 
         provider, env = self._build_provider(config)
         if config.mode == "redteam":
-            doc = self._build_redteam_yaml(config, provider)
+            gen_provider, gen_env = self._build_generation_provider(config)
+            env.update(gen_env)
+            doc = self._build_redteam_yaml(config, provider, gen_provider)
         else:
             doc = self._build_eval_yaml(config, provider, tests_csv_name=tests_csv_name)
         return yaml.safe_dump(doc, sort_keys=False), env
@@ -577,10 +1036,6 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
 
     @staticmethod
     def _bundled_node_bin() -> Path | None:
-        """Directory of the Node runtime bundled with this plugin via
-        nodejs-wheel-binaries (node/npm/npx live here). Returns None if the
-        wheel is unavailable. Keeps promptfoo self-contained — no Node on the
-        host/image required."""
         try:
             from nodejs_wheel.executable import ROOT_DIR
         except Exception:
@@ -589,17 +1044,12 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         return bin_dir if bin_dir.is_dir() else None
 
     def _resolve_promptfoo(self) -> list[str]:
-        # Prefer anything already on PATH (lets a host/image override win).
         binary = shutil.which("promptfoo")
         if binary:
             return [binary]
         npx = shutil.which("npx")
         if npx:
             return [npx, "-y", "promptfoo@latest"]
-        # Fall back to the Node bundled with the plugin (self-contained).
-        # Invoke npm's npx-cli.js with the bundled node directly: the bin/npx
-        # shim resolves its modules relative to its own path and breaks when
-        # called by absolute path, whereas `node .../npm/bin/npx-cli.js` works.
         bundled = self._bundled_node_bin()
         if bundled:
             node = bundled / "node"
@@ -611,6 +1061,26 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
             "bundled nodejs-wheel-binaries Node was not found. Reinstall the "
             "plugin (it depends on nodejs-wheel-binaries)."
         )
+
+    @staticmethod
+    def _redact_yaml(yaml_text: str) -> str:
+        """Replace credential values in a YAML string for safe logging."""
+        import re
+        # Redact simple key: value patterns for known credential keys.
+        result = re.sub(
+            r"((?:apiKey|api_key|apikey|password|credential|OPENAI_API_KEY|ANTHROPIC_API_KEY|GOOGLE_API_KEY)\s*:\s*)['\"]?[A-Za-z0-9_\-\.]{8,}['\"]?",
+            r"\1<redacted>",
+            yaml_text,
+            flags=re.IGNORECASE,
+        )
+        # Redact Authorization header values (Bearer token or bare token).
+        result = re.sub(
+            r"(Authorization\s*:\s*['\"]?(?:Bearer\s+)?)[A-Za-z0-9_\-\.]{8,}(['\"]?)",
+            r"\1<redacted>\2",
+            result,
+            flags=re.IGNORECASE,
+        )
+        return result
 
     # ── Result aggregation ─────────────────────────────────────────────
 
@@ -706,11 +1176,6 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
 
     @staticmethod
     def _truncate(text: Any, limit: int = 2000) -> str:
-        """Coerce a cell value to str and cap its length so the CSV stays usable.
-
-        Non-string outputs (dicts/lists from structured providers) are JSON-dumped
-        so the cell is still a readable string rather than a Python repr.
-        """
         if text is None:
             return ""
         if not isinstance(text, str):
@@ -724,13 +1189,6 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
 
     @staticmethod
     def _assertions_summary(grading: dict) -> str:
-        """Compact per-assertion summary from gradingResult.componentResults[].
-
-        Each component is a GradingResult: { pass: bool, reason: str,
-        assertion: { type: str, value: any } }. Renders e.g.
-        ``is-refusal: pass; contains: fail (expected '4')``. The expected value
-        is only appended when the assertion failed and a value is present.
-        """
         components = (grading or {}).get("componentResults") or []
         parts: list[str] = []
         for c in components:
@@ -754,16 +1212,6 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
 
     @classmethod
     def _build_per_test_csv(cls, results_payload: dict, mode: str = "eval") -> str:
-        """Build the wide per-row results CSV (one row per test).
-
-        Parses promptfoo's native results JSON — ``results.results[]`` where each
-        element is an ``EvaluateResult`` with: ``prompt.raw`` (rendered prompt),
-        ``response.output`` (model text), ``vars``, ``success``, ``score``,
-        ``latencyMs``, ``cost``, and ``gradingResult.componentResults[]``. All key
-        access is defensive (falls back to "" / None) since field names vary by
-        promptfoo version. Redteam results share this shape; ``metadata.severity``
-        is appended as an extra column when present (prompt = adversarial probe).
-        """
         results_array = results_payload.get("results", [])
         if isinstance(results_array, dict):
             results_array = results_array.get("results", [])
@@ -829,16 +1277,10 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         workspace = Path(os.getcwd())
 
         # ── Dataset source resolution (eval mode only) ────────────────────
-        # The core stack hands us the uploaded file as raw bytes (or None); the
-        # plugin decides whether to use it. Layered precedence, fail-loud only
-        # where it would otherwise silently do nothing:
-        #   raw_yaml  >  uploaded eval-tests CSV  >  inline test_cases
-        uploaded_bytes = self.get_input_data("eval-tests-file")  # bytes or None
+        uploaded_bytes = self.get_input_data("eval-tests-file")
         tests_csv_name: str | None = None
 
         if uploaded_bytes is not None and config.mode != "eval":
-            # Redteam is generative — there's no row dataset. Ignore the file
-            # rather than failing, and say so in the log.
             self.logger.info(
                 "An eval-tests CSV was uploaded but mode is 'redteam'; ignoring it "
                 "(redteam generates its own adversarial tests). Switch to eval mode "
@@ -846,17 +1288,12 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
             )
         elif uploaded_bytes is not None and config.mode == "eval":
             if config.raw_yaml.strip():
-                # raw_yaml wins; the CSV is not referenced. Note it so the user
-                # isn't surprised their upload was skipped.
                 self.logger.info(
                     "Both raw_yaml and an eval-tests CSV are present; raw_yaml takes "
                     "precedence, so the uploaded CSV is ignored. Clear raw_yaml to use "
                     "the CSV instead."
                 )
             else:
-                # CSV wins over inline test_cases. Write it next to the config so
-                # promptfoo resolves `tests: tests.csv` relative to the config dir,
-                # and parses it natively (rows = tests, headers = {{vars}}).
                 tests_csv_name = "tests.csv"
                 (workspace / tests_csv_name).write_bytes(uploaded_bytes)
                 self.upload_artifact(tests_csv_name, uploaded_bytes)
@@ -866,10 +1303,6 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
                         "inline test_cases, which are ignored for this run."
                     )
 
-        # Fail fast on a misconfigured `eval` run: with no tests at all, promptfoo
-        # has nothing to substitute template vars into and produces zero results —
-        # a confusing silent success. Accept ANY of: raw_yaml, an uploaded CSV, or
-        # at least one inline test_case.
         if (
             config.mode == "eval"
             and not config.raw_yaml.strip()
@@ -887,14 +1320,16 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         config_path.write_text(config_yaml)
         self.upload_artifact("promptfooconfig.yaml", config_yaml.encode("utf-8"))
 
+        # Upload a redacted copy for diagnostics (never expose credentials).
+        redacted_yaml = self._redact_yaml(config_yaml)
+        self.upload_artifact("promptfooconfig.redacted.yaml", redacted_yaml.encode("utf-8"))
+
         results_path = workspace / "output" / "promptfoo_results.json"
         results_path.parent.mkdir(exist_ok=True)
 
         binary = self._resolve_promptfoo()
 
         env_vars = {**os.environ, **provider_env}
-        # Ensure the bundled Node is discoverable by promptfoo's own child
-        # processes (npx spawns `node`), so the run works with no Node on PATH.
         bundled_bin = self._bundled_node_bin()
         if bundled_bin:
             env_vars["PATH"] = f"{bundled_bin}{os.pathsep}{env_vars.get('PATH', '')}"
@@ -902,15 +1337,18 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         env_vars.setdefault("PROMPTFOO_DISABLE_UPDATE", "1")
         env_vars.setdefault("PROMPTFOO_DISABLE_SHARE_INFO", "1")
 
-        # Promptfoo gates redteam runs behind an "email verification" prompt
-        # in the CLI. Set a non-empty email via `promptfoo config set email`
-        # so the gate auto-passes. Idempotent + offline. Uses (in priority):
-        #   1. user-supplied `promptfoo_email` config field
-        #   2. PROMPTFOO_USER_EMAIL env override
-        #   3. placeholder `vera@localhost`
+        # Log the promptfoo version for diagnostics.
+        try:
+            ver_proc = subprocess.run(
+                binary + ["--version"],
+                capture_output=True, text=True, env=env_vars, timeout=30,
+            )
+            pf_version = (ver_proc.stdout or ver_proc.stderr or "unknown").strip().splitlines()[0]
+            self.logger.info(f"Promptfoo version: {pf_version}")
+        except Exception as exc:
+            self.logger.info(f"Could not determine promptfoo version: {exc}")
+
         if config.mode == "redteam":
-            # Disable cloud generation so attack synthesis stays local, avoiding
-            # the email-verification gate.
             env_vars["PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION"] = "true"
             email = (
                 (config.promptfoo_email or "").strip()
@@ -921,10 +1359,7 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
                 subprocess.run(
                     binary + ["config", "set", "email", email],
                     env=env_vars,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=30,
+                    capture_output=True, text=True, check=False, timeout=30,
                 )
             except Exception as exc:
                 self.logger.warning(f"promptfoo config set email failed (continuing): {exc}")
@@ -933,6 +1368,7 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         stderr_acc: list[str] = []
 
         def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+            # Log command with binary path; credentials never appear in cmd.
             self.logger.info(f"Launching Promptfoo: {' '.join(cmd)}")
             return subprocess.run(
                 cmd,
@@ -947,16 +1383,22 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         )
 
         if config.mode == "redteam":
-            # Step 1: generate adversarial tests into redteam.yaml.
-            # The same target provider is used as the attack generator so
-            # everything stays inside the user's chosen environment (e.g. ollama).
-            generator_provider, _ = self._build_provider(config)
+            # Generation concurrency: use generation_max_concurrency, forced to 1
+            # when generation_delay_ms is set (delay + concurrency > 1 is contradictory).
+            gen_concurrency = config.generation_max_concurrency
+            if config.generation_delay_ms > 0:
+                gen_concurrency = 1
+                self.logger.info(
+                    f"generation_delay_ms={config.generation_delay_ms} ms is set; "
+                    "forcing generation concurrency to 1."
+                )
+
             redteam_yaml = workspace / "redteam.yaml"
             gen_cmd = binary + [
                 "redteam", "generate",
                 "--config", str(config_path),
                 "--output", str(redteam_yaml),
-                "--max-concurrency", str(config.max_concurrency),
+                "--max-concurrency", str(gen_concurrency),
                 "--no-cache",
                 "--force",
                 "--no-progress-bar",
@@ -977,7 +1419,6 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
                 TaskProgress(progress=0.5, extra={"phase": "executing"})
             )
 
-            # Step 2: evaluate the generated tests against the target.
             eval_cmd = binary + [
                 "eval",
                 "--config", str(redteam_yaml),
@@ -1007,9 +1448,6 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         self.upload_artifact("promptfoo_stdout.log", "".join(stdout_acc).encode("utf-8"))
         self.upload_artifact("promptfoo_stderr.log", "".join(stderr_acc).encode("utf-8"))
 
-        # Promptfoo eval exits 100 when test failures occur — that's still a
-        # successful run, just with regressions. Only treat rc!=0 AND missing
-        # output as fatal.
         if not results_path.exists():
             tail = (proc.stderr or proc.stdout or "")[-2000:]
             raise RuntimeError(
@@ -1019,16 +1457,12 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
         payload = json.loads(results_path.read_text())
         self.upload_artifact("promptfoo_results.json", results_path.read_bytes())
 
-        # Wide, scannable per-row CSV (one row per test) with the raw prompt and
-        # model response inline. Best-effort: a parse failure here must never sink
-        # an otherwise-successful eval, so it's logged and skipped. Redteam shares
-        # promptfoo's results shape (prompt = adversarial probe, plus severity).
         try:
             per_test_csv = self._build_per_test_csv(payload, mode=config.mode)
             self.upload_artifact(
                 "promptfoo_per_test.csv", per_test_csv.encode("utf-8")
             )
-        except Exception as exc:  # noqa: BLE001 - never break the eval on a CSV hiccup
+        except Exception as exc:  # noqa: BLE001
             self.logger.warning(
                 "Skipping promptfoo_per_test.csv artifact: failed to build the "
                 "per-row results CSV from the promptfoo results JSON (%s: %s).",
@@ -1067,11 +1501,6 @@ class PromptfooPlugin(BaseEvaluationPlugin[PromptfooConfig]):
             "category": str(t.get("category") or ""),
             "strategy": str(t.get("strategy") or ""),
         }
-
-    # Aggregate, single-valued KPIs (one value per run). These populate the Key
-    # Results scorecard and the summary table. The per-test breakdown is NOT
-    # emitted as metrics any more — it lives in the wide `promptfoo_per_test.csv`
-    # ("Per-run results"), so we don't repeat every test as long-format rows.
 
     @metric("pass_rate")
     def pass_rate_metric(self, output: dict) -> list[Measure]:
